@@ -28,6 +28,14 @@ class IsYatirimProvider(BaseProvider):
     FINANCIAL_GROUP_INDUSTRIAL = "XI_29"  # Sanayi şirketleri
     FINANCIAL_GROUP_BANK = "UFRS"  # Bankalar
 
+    # itemCode prefixes for filtering financial statement rows
+    # The MaliTablo API returns all tables combined; we filter by itemCode prefix.
+    ITEM_CODE_PREFIXES = {
+        "balance_sheet": ("1", "2"),  # 1xxx=Aktif, 2xxx=Pasif
+        "income_stmt": ("3",),       # 3xxx=Gelir Tablosu
+        "cashflow": ("4",),          # 4xxx=Nakit Akış
+    }
+
     # Known market indices
     INDICES = {
         "XU100": "BIST 100",
@@ -587,15 +595,6 @@ class IsYatirimProvider(BaseProvider):
         if financial_group is None:
             financial_group = self.FINANCIAL_GROUP_INDUSTRIAL
 
-        # Map statement type to table names
-        table_map = {
-            "balance_sheet": ["BILANCO_AKTIF", "BILANCO_PASIF"],
-            "income_stmt": ["GELIR_TABLOSU"],
-            "cashflow": ["NAKIT_AKIM_TABLOSU"],
-        }
-
-        tables = table_map.get(statement_type, ["BILANCO_AKTIF", "BILANCO_PASIF"])
-
         # Generate all periods needed
         current_year = datetime.now().year
         periods = self._get_periods(current_year, quarterly, count=count)
@@ -606,38 +605,32 @@ class IsYatirimProvider(BaseProvider):
             for i in range(0, len(periods), self._MAX_PERIODS_PER_CALL)
         ]
 
-        all_data = []
-        for table_name in tables:
-            table_dfs = []
-            for batch_periods in batches:
-                try:
-                    df = self._fetch_financial_table(
-                        symbol=symbol,
-                        table_name=table_name,
-                        financial_group=financial_group,
-                        periods=batch_periods,
-                        quarterly=quarterly,
-                    )
-                    if not df.empty:
-                        table_dfs.append(df)
-                except Exception:
-                    continue
+        # Single API call per batch (API returns all tables combined;
+        # we filter by itemCode prefix in _parse_financial_response)
+        all_dfs = []
+        for batch_periods in batches:
+            try:
+                df = self._fetch_financial_table(
+                    symbol=symbol,
+                    financial_group=financial_group,
+                    periods=batch_periods,
+                    quarterly=quarterly,
+                    statement_type=statement_type,
+                )
+                if not df.empty:
+                    all_dfs.append(df)
+            except Exception:
+                continue
 
-            if table_dfs:
-                # Merge batches horizontally (same rows, different period columns)
-                merged = table_dfs[0]
-                for extra_df in table_dfs[1:]:
-                    # Only add columns that don't already exist
-                    new_cols = [c for c in extra_df.columns if c not in merged.columns]
-                    if new_cols:
-                        merged = merged.join(extra_df[new_cols], how="outer")
-                all_data.append(merged)
-
-        if not all_data:
+        if not all_dfs:
             raise DataNotAvailableError(f"No financial data available for {symbol}")
 
-        result = pd.concat(all_data, axis=0) if len(all_data) > 1 else all_data[0]
-        result = result.drop_duplicates()
+        # Merge batches horizontally (same rows, different period columns)
+        result = all_dfs[0]
+        for extra_df in all_dfs[1:]:
+            new_cols = [c for c in extra_df.columns if c not in result.columns]
+            if new_cols:
+                result = result.join(extra_df[new_cols], how="outer")
 
         # Sort columns: most recent first
         result = result[sorted(result.columns, key=self._period_sort_key, reverse=True)]
@@ -740,12 +733,12 @@ class IsYatirimProvider(BaseProvider):
     def _fetch_financial_table(
         self,
         symbol: str,
-        table_name: str,
         financial_group: str,
         periods: list[tuple[int, int]],
         quarterly: bool = False,
+        statement_type: str | None = None,
     ) -> pd.DataFrame:
-        """Fetch a specific financial table for up to 5 periods."""
+        """Fetch financial data for up to 5 periods and filter by statement type."""
         url = f"{self.BASE_URL}/Data.aspx/MaliTablo"
 
         # Build params with multiple year/period pairs
@@ -765,13 +758,16 @@ class IsYatirimProvider(BaseProvider):
         except Exception as e:
             raise APIError(f"Failed to fetch financial data for {symbol}: {e}") from e
 
-        return self._parse_financial_response(data, periods, quarterly=quarterly)
+        return self._parse_financial_response(
+            data, periods, quarterly=quarterly, statement_type=statement_type
+        )
 
     def _parse_financial_response(
         self,
         data: Any,
         periods: list[tuple[int, int]],
         quarterly: bool = False,
+        statement_type: str | None = None,
     ) -> pd.DataFrame:
         """Parse MaliTablo API response into DataFrame.
 
@@ -781,6 +777,8 @@ class IsYatirimProvider(BaseProvider):
             quarterly: Whether these are quarterly periods. Passed explicitly
                        to avoid misdetection when a single-quarter batch has
                        period=12 (which looks like annual).
+            statement_type: If given, filter items by itemCode prefix using
+                            ITEM_CODE_PREFIXES mapping.
         """
         if not data or not isinstance(data, dict):
             return pd.DataFrame()
@@ -789,6 +787,16 @@ class IsYatirimProvider(BaseProvider):
         items = data.get("value", [])
         if not items:
             return pd.DataFrame()
+
+        # Filter by itemCode prefix when statement_type is specified
+        prefixes = self.ITEM_CODE_PREFIXES.get(statement_type) if statement_type else None
+        if prefixes:
+            items = [
+                item for item in items
+                if str(item.get("itemCode", "")).startswith(prefixes)
+            ]
+            if not items:
+                return pd.DataFrame()
 
         records = []
         for item in items:

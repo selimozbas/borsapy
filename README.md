@@ -142,9 +142,9 @@ df = hisse.history(period="1ay", interval="1d")  # Günlük mumlar (varsayılan)
 
 ```python
 # Yıllık tablolar (sınai şirketler için)
-print(hisse.balance_sheet)          # Bilanço
-print(hisse.income_stmt)            # Gelir tablosu
-print(hisse.cashflow)               # Nakit akış
+print(hisse.balance_sheet)          # Bilanço (70 satır)
+print(hisse.income_stmt)            # Gelir tablosu (43 satır)
+print(hisse.cashflow)               # Nakit akış (34 satır)
 
 # Çeyreklik tablolar
 print(hisse.quarterly_balance_sheet)
@@ -160,11 +160,10 @@ print(hisse.get_income_stmt(last_n=10))                  # 10 yıllık gelir tab
 print(hisse.get_balance_sheet(quarterly=True, last_n=20)) # 20 çeyreklik bilanço
 print(hisse.get_cashflow(last_n="all"))                   # Tüm mevcut dönemler
 
-# Bankalar için (UFRS formatı)
+# Bankalar için (UFRS formatı — sadece bilanço ve gelir tablosu)
 banka = bp.Ticker("AKBNK")
-print(banka.get_balance_sheet(financial_group="UFRS"))
-print(banka.get_income_stmt(financial_group="UFRS"))
-print(banka.get_cashflow(financial_group="UFRS"))
+print(banka.get_balance_sheet(financial_group="UFRS"))  # 130 satır
+print(banka.get_income_stmt(financial_group="UFRS"))    # 62 satır
 
 # Banka çeyreklik tablolar
 print(banka.get_balance_sheet(quarterly=True, financial_group="UFRS"))
@@ -172,10 +171,11 @@ print(banka.get_income_stmt(quarterly=True, financial_group="UFRS"))
 
 # Banka TTM
 print(banka.get_ttm_income_stmt(financial_group="UFRS"))
-print(banka.get_ttm_cashflow(financial_group="UFRS"))
 ```
 
 > **Not**: Sınai şirketler varsayılan olarak `XI_29` formatını kullanır. Bankalar için `financial_group="UFRS"` parametresi gereklidir.
+>
+> UFRS banka formatında nakit akış tablosu (`get_cashflow`) bulunmamaktadır. `get_cashflow(financial_group="UFRS")` çağrısı `DataNotAvailableError` fırlatır.
 >
 > `last_n` parametresi: `None` (varsayılan 5 dönem), `int` (tam sayı kadar dönem), `"all"` (tüm mevcut dönemler). 5'ten fazla dönem istendiğinde otomatik olarak birden fazla API çağrısı yapılır.
 

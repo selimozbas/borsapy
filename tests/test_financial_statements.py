@@ -241,7 +241,7 @@ class TestBatching:
         """Create a mock _fetch_financial_table that returns distinct DataFrames per batch."""
         call_count = {"n": 0}
 
-        def side_effect(symbol, table_name, financial_group, periods, quarterly=False):
+        def side_effect(symbol, financial_group, periods, quarterly=False, statement_type=None):
             call_count["n"] += 1
             batch_num = call_count["n"]
             records = []
@@ -299,15 +299,15 @@ class TestBatching:
 
     @patch.object(IsYatirimProvider, "_cache_get", return_value=None)
     @patch.object(IsYatirimProvider, "_cache_set")
-    def test_balance_sheet_batches_per_table(self, mock_cache_set, mock_cache_get):
-        """balance_sheet has 2 tables; each should get batched separately."""
+    def test_balance_sheet_batches(self, mock_cache_set, mock_cache_get):
+        """balance_sheet with last_n=6 needs 2 batches (5+1). No per-table loop."""
         fetch_mock, call_count = self._mock_fetch()
         with patch.object(self.provider, "_fetch_financial_table", side_effect=fetch_mock):
             self.provider.get_financial_statements(
                 "THYAO", "balance_sheet", quarterly=False, last_n=6
             )
-        # 2 tables × 2 batches each = 4 calls
-        assert call_count["n"] == 4
+        # 2 batches (table loop removed — API returns all tables, we filter by itemCode)
+        assert call_count["n"] == 2
 
 
 # =============================================================================
@@ -353,7 +353,7 @@ class TestColumnSorting:
     def test_annual_columns_sorted_descending(self, mock_cache_set, mock_cache_get):
         """Annual columns should be ordered most recent first."""
         # Mock fetch to return out-of-order columns
-        def mock_fetch(symbol, table_name, financial_group, periods, quarterly=False):
+        def mock_fetch(symbol, financial_group, periods, quarterly=False, statement_type=None):
             data = {"2022": [1], "2024": [2], "2023": [3]}
             return pd.DataFrame(data, index=pd.Index(["Revenue"], name="Item"))
 
@@ -366,7 +366,7 @@ class TestColumnSorting:
     @patch.object(IsYatirimProvider, "_cache_set")
     def test_quarterly_columns_sorted_descending(self, mock_cache_set, mock_cache_get):
         """Quarterly columns should be ordered most recent first."""
-        def mock_fetch(symbol, table_name, financial_group, periods, quarterly=False):
+        def mock_fetch(symbol, financial_group, periods, quarterly=False, statement_type=None):
             data = {"2024Q1": [1], "2024Q3": [2], "2024Q2": [3]}
             return pd.DataFrame(data, index=pd.Index(["Revenue"], name="Item"))
 
@@ -465,7 +465,7 @@ class TestMergeDedup:
         """Columns should not be duplicated when batches return overlapping periods."""
         call_idx = {"n": 0}
 
-        def mock_fetch(symbol, table_name, financial_group, periods, quarterly=False):
+        def mock_fetch(symbol, financial_group, periods, quarterly=False, statement_type=None):
             call_idx["n"] += 1
             if call_idx["n"] == 1:
                 # Batch 1 returns 5 columns
@@ -501,7 +501,7 @@ class TestEdgeCases:
         """If older batch returns empty, recent data should still be present."""
         call_idx = {"n": 0}
 
-        def mock_fetch(symbol, table_name, financial_group, periods, quarterly=False):
+        def mock_fetch(symbol, financial_group, periods, quarterly=False, statement_type=None):
             call_idx["n"] += 1
             if call_idx["n"] == 1:
                 data = {"2025": [100], "2024": [200]}
@@ -523,3 +523,144 @@ class TestEdgeCases:
         ]
         assert len(batches) == 1
         assert len(batches[0]) == 5
+
+
+# =============================================================================
+# Unit Tests: itemCode filtering
+# =============================================================================
+
+
+class TestItemCodeFiltering:
+    """Tests for filtering financial statement rows by itemCode prefix."""
+
+    def setup_method(self):
+        self.provider = IsYatirimProvider()
+
+    def _make_response(self, items):
+        """Create a mock API response with given item dicts."""
+        return {"value": items}
+
+    def _item(self, code, desc, val):
+        """Helper to create a single API response item."""
+        return {"itemCode": code, "itemDescTr": desc, "value1": val}
+
+    def test_income_stmt_only_3xxx(self):
+        """income_stmt should only include itemCode starting with '3'."""
+        data = self._make_response([
+            self._item("1001", "Cash", 100),
+            self._item("2001", "Liabilities", 200),
+            self._item("3001", "Revenue", 500),
+            self._item("3002", "COGS", 300),
+            self._item("4001", "Operating CF", 50),
+        ])
+        periods = [(2025, 12)]
+        df = self.provider._parse_financial_response(
+            data, periods, quarterly=False, statement_type="income_stmt"
+        )
+        assert len(df) == 2
+        assert "Revenue" in df.index
+        assert "COGS" in df.index
+
+    def test_balance_sheet_only_1xxx_2xxx(self):
+        """balance_sheet should include itemCode starting with '1' or '2'."""
+        data = self._make_response([
+            self._item("1001", "Cash", 100),
+            self._item("1200", "Receivables", 150),
+            self._item("2001", "Liabilities", 200),
+            self._item("3001", "Revenue", 500),
+            self._item("4001", "Operating CF", 50),
+        ])
+        periods = [(2025, 12)]
+        df = self.provider._parse_financial_response(
+            data, periods, quarterly=False, statement_type="balance_sheet"
+        )
+        assert len(df) == 3
+        assert "Cash" in df.index
+        assert "Receivables" in df.index
+        assert "Liabilities" in df.index
+
+    def test_cashflow_only_4xxx(self):
+        """cashflow should only include itemCode starting with '4'."""
+        data = self._make_response([
+            self._item("1001", "Cash", 100),
+            self._item("3001", "Revenue", 500),
+            self._item("4001", "Operating CF", 50),
+            self._item("4002", "Investing CF", -30),
+            self._item("4003", "Financing CF", 20),
+        ])
+        periods = [(2025, 12)]
+        df = self.provider._parse_financial_response(
+            data, periods, quarterly=False, statement_type="cashflow"
+        )
+        assert len(df) == 3
+        assert "Operating CF" in df.index
+        assert "Investing CF" in df.index
+        assert "Financing CF" in df.index
+
+    def test_no_itemcode_excluded_when_filtering(self):
+        """Items without itemCode should be excluded when filtering is active."""
+        data = self._make_response([
+            {"itemDescTr": "NoCode", "value1": 999},
+            self._item("3001", "Revenue", 500),
+        ])
+        periods = [(2025, 12)]
+        df = self.provider._parse_financial_response(
+            data, periods, quarterly=False, statement_type="income_stmt"
+        )
+        assert len(df) == 1
+        assert "Revenue" in df.index
+
+    def test_no_filtering_when_statement_type_none(self):
+        """When statement_type is None, all items should be included."""
+        data = self._make_response([
+            self._item("1001", "Cash", 100),
+            self._item("3001", "Revenue", 500),
+            self._item("4001", "Operating CF", 50),
+        ])
+        periods = [(2025, 12)]
+        df = self.provider._parse_financial_response(
+            data, periods, quarterly=False, statement_type=None
+        )
+        assert len(df) == 3
+
+    def test_mixed_codes_properly_separated(self):
+        """Different statement types should get distinct subsets from same data."""
+        items = [
+            self._item("1001", "Cash", 100),
+            self._item("2001", "Debt", 200),
+            self._item("3001", "Revenue", 500),
+            self._item("4001", "CF Ops", 50),
+        ]
+        data = self._make_response(items)
+        periods = [(2025, 12)]
+
+        bs = self.provider._parse_financial_response(
+            data, periods, quarterly=False, statement_type="balance_sheet"
+        )
+        inc = self.provider._parse_financial_response(
+            data, periods, quarterly=False, statement_type="income_stmt"
+        )
+        cf = self.provider._parse_financial_response(
+            data, periods, quarterly=False, statement_type="cashflow"
+        )
+
+        assert len(bs) == 2
+        assert len(inc) == 1
+        assert len(cf) == 1
+
+        # No overlap
+        assert set(bs.index) & set(inc.index) == set()
+        assert set(bs.index) & set(cf.index) == set()
+        assert set(inc.index) & set(cf.index) == set()
+
+    def test_empty_after_filtering_returns_empty_df(self):
+        """If all items are filtered out, return empty DataFrame."""
+        data = self._make_response([
+            self._item("1001", "Cash", 100),
+            self._item("2001", "Debt", 200),
+        ])
+        periods = [(2025, 12)]
+        df = self.provider._parse_financial_response(
+            data, periods, quarterly=False, statement_type="cashflow"
+        )
+        assert df.empty
